@@ -1,0 +1,45 @@
+on:
+  push:
+    tags:
+      - "v*"
+name: Create new release
+jobs:
+  docker-build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get tag name
+        id: tag_name
+        run: |
+          tag=${GITHUB_TAG/refs\/tags\//}
+          echo ::set-output name=tag::$tag
+        env:
+          GITHUB_TAG: ${{ github.ref }}
+      - name: Checkout
+        uses: actions/checkout@v2.3.4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+      - name: Login to ECR public
+        id: login-ecr
+        run: |
+          aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/o1j4x7p4
+      - name: Build
+        run: |
+          docker build -t public.ecr.aws/o1j4x7p4/porter-ecr-secrets-updater:${{steps.tag_name.outputs.tag}} -t public.ecr.aws/o1j4x7p4/porter-ecr-secrets-updater:latest .
+      - name: Push
+        run: |
+          docker push public.ecr.aws/o1j4x7p4/porter-ecr-secrets-updater:${{steps.tag_name.outputs.tag}}
+          docker push public.ecr.aws/o1j4x7p4/porter-ecr-secrets-updater:latest
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
