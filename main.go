@@ -5,8 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"flag"
+	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"strings"
 
@@ -25,32 +26,28 @@ import (
 var (
 	ecrPattern = regexp.MustCompile(`(^[a-zA-Z0-9][a-zA-Z0-9-_]*)\.dkr\.ecr(\-fips)?\.([a-zA-Z0-9][a-zA-Z0-9-_]*)\.amazonaws\.com(\.cn)?`)
 
-	awsAccessKeyID     = ""
-	awsSecretAccessKey = ""
-	awsSessionToken    = ""
+	awsAccessKeyID     = os.Getenv("AWS_ACCESS_KEY_ID")
+	awsSecretAccessKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	awsSessionToken    = os.Getenv("AWS_SESSION_TOKEN")
 )
 
 func main() {
-	flag.StringVar(&awsAccessKeyID, "aws_access_key_id", "", "the AWSAccessKeyId to use")
-	flag.StringVar(&awsSecretAccessKey, "aws_secret_access_key", "", "the AWSSecretKey to use")
-	flag.StringVar(&awsSessionToken, "aws_session_token", "", "(optional) required for temporary security credentials retrieved via STS")
-
-	flag.Parse()
-
 	if awsAccessKeyID == "" || awsSecretAccessKey == "" {
-		log.Fatalln("'aws_access_key_id' and 'aws_secret_access_key' are required flags")
+		log.Fatalln("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required environment variables and must be set")
 	}
 
 	config, err := rest.InClusterConfig()
 
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalln(fmt.Errorf("error getting in-cluster config: %w", err))
 	}
 
 	clientset := kubernetes.NewForConfigOrDie(config)
 
 	var namespaces []string
 	var continueStr string
+
+	log.Println("fetching list of namespaces in this cluster")
 
 	for {
 		namespaceList, err := clientset.CoreV1().Namespaces().List(
@@ -61,7 +58,7 @@ func main() {
 		)
 
 		if err != nil {
-			log.Fatalln(err)
+			log.Fatalln(fmt.Errorf("error fetching list of namespaces: %w", err))
 		}
 
 		for _, ns := range namespaceList.Items {
@@ -75,29 +72,39 @@ func main() {
 		continueStr = namespaceList.Continue
 	}
 
+	log.Printf("fetched %d namespaces\n", len(namespaces))
+
 	var pods []v1.Pod
 	continueStr = ""
 
+	log.Println("fetching list of pods in all namespaces in this cluster")
+
 	for _, ns := range namespaces {
-		podList, err := clientset.CoreV1().Pods(ns).List(
-			context.Background(), metav1.ListOptions{
-				Limit:    100,
-				Continue: continueStr,
-			},
-		)
+		for {
+			podList, err := clientset.CoreV1().Pods(ns).List(
+				context.Background(), metav1.ListOptions{
+					Limit:    100,
+					Continue: continueStr,
+				},
+			)
 
-		if err != nil {
-			log.Fatalln(err)
+			if err != nil {
+				log.Fatalln(fmt.Errorf("error fetching list of pods for namespace %s: %w", ns, err))
+			}
+
+			pods = append(pods, podList.Items...)
+
+			if podList.Continue == "" {
+				break
+			}
+
+			continueStr = podList.Continue
 		}
-
-		pods = append(pods, podList.Items...)
-
-		if podList.Continue == "" {
-			break
-		}
-
-		continueStr = podList.Continue
 	}
+
+	log.Printf("fetched %d pods across all namespaces\n", len(pods))
+
+	checked := make(map[string]bool)
 
 	for _, pod := range pods {
 		podSpec := pod.Spec
@@ -115,39 +122,54 @@ func main() {
 					continue
 				}
 
+				checkedMapEntryKey := fmt.Sprintf("%s:%s", pullSecret.Name, pod.GetNamespace())
+
+				if _, ok := checked[checkedMapEntryKey]; ok {
+					// already checked and possibly updated secret
+					continue
+				}
+
+				log.Printf("found pod '%s' in namespace '%s' with ECR secret '%s' to possibly update",
+					pod.GetName(), pod.GetNamespace(), pullSecret.Name)
+
 				secret, err := clientset.CoreV1().Secrets(pod.GetNamespace()).Get(
 					context.Background(), pullSecret.Name, metav1.GetOptions{},
 				)
 
 				if err != nil {
-					log.Fatalln(err)
+					log.Fatalln(fmt.Errorf("error fetching secret '%s' in namespace '%s': %w",
+						pullSecret.Name, pod.GetNamespace(), err))
 				}
 
 				prevData, exists := secret.Data[v1.DockerConfigJsonKey]
 
 				if !exists {
+					log.Println("no DockerConfigJsonKey found, skipping")
+
 					continue
 				}
 
 				sess, err := getAWSSession(matches[3])
 
 				if err != nil {
-					log.Fatalln(err)
+					log.Fatalln(fmt.Errorf("error getting AWS session: %w", err))
 				}
 
 				dockerConfigFile, err := getDockerConfigFile(sess, regURL)
 
 				if err != nil {
-					log.Fatalln(err)
+					log.Fatalln(fmt.Errorf("error getting docker config file: %w", err))
 				}
 
 				newData, err := json.Marshal(dockerConfigFile)
 
 				if err != nil {
-					log.Fatalln(err)
+					log.Fatalln(fmt.Errorf("error marshalling docker config file JSON data"))
 				}
 
 				if !bytes.Equal(prevData, newData) {
+					log.Println("updating outdated secret")
+
 					_, err := clientset.CoreV1().Secrets(pod.GetNamespace()).Update(
 						context.Background(),
 						&v1.Secret{
@@ -163,9 +185,13 @@ func main() {
 					)
 
 					if err != nil {
-						log.Fatalln(err)
+						log.Fatalln(fmt.Errorf("error updating secret: %w", err))
 					}
+				} else {
+					log.Println("no change to the secret required")
 				}
+
+				checked[checkedMapEntryKey] = true
 			}
 		}
 	}
