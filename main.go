@@ -155,7 +155,7 @@ func main() {
 					log.Fatalln(fmt.Errorf("error getting AWS session: %w", err))
 				}
 
-				dockerConfigFile, err := getDockerConfigFile(sess, regURL)
+				dockerConfigFile, err := getDockerConfigFile(sess, strings.Split(regURL, "/")[0])
 
 				if err != nil {
 					log.Fatalln(fmt.Errorf("error getting docker config file: %w", err))
